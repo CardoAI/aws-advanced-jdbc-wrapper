@@ -21,6 +21,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
+import java.util.logging.Logger;
 import java.util.stream.Collectors;
 import software.amazon.jdbc.HostListProviderService;
 import software.amazon.jdbc.HostSpec;
@@ -33,6 +34,8 @@ import software.amazon.jdbc.util.RdsUtils;
 import software.amazon.jdbc.util.StringUtils;
 
 public class AuroraGlobalDbMonitoringHostListProvider extends MonitoringRdsHostListProvider {
+
+  static final Logger LOGGER = Logger.getLogger(AuroraGlobalDbMonitoringHostListProvider.class.getName());
 
   protected Map<String, HostSpec> globalClusterInstanceTemplateByAwsRegion = new HashMap<>();
 
@@ -67,13 +70,18 @@ public class AuroraGlobalDbMonitoringHostListProvider extends MonitoringRdsHostL
 
     HostSpecBuilder hostSpecBuilder = this.hostListProviderService.getHostSpecBuilder();
     this.globalClusterInstanceTemplateByAwsRegion = Arrays.stream(templates.split(","))
+        .map(x -> ConnectionUrlParser.parseHostPortPairWithRegionPrefix(x.trim(), () -> hostSpecBuilder))
         .collect(Collectors.toMap(
-            rdsUtils::getRdsRegion,
-            x -> {
-              HostSpec hostSpec = ConnectionUrlParser.parseHostPortPair(x.trim(), () -> hostSpecBuilder);
-              this.validateHostPatternSetting(hostSpec.getHost());
-              return hostSpec;
+            k -> k.getValue1(),
+            v -> {
+              this.validateHostPatternSetting(v.getValue2().getHost());
+              return v.getValue2();
             }));
+    LOGGER.finest(() -> "Recognized GDB instance template patterns:\n"
+          + this.globalClusterInstanceTemplateByAwsRegion.entrySet().stream()
+              .map(x -> String.format("\t[%s] -> %s", x.getKey(), x.getValue().getHostAndPort()))
+              .collect(Collectors.joining("\n"))
+    );
   }
 
   protected ClusterTopologyMonitor initMonitor() {
