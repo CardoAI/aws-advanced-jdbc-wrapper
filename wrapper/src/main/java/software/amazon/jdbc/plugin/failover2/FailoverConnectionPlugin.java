@@ -16,14 +16,17 @@
 
 package software.amazon.jdbc.plugin.failover2;
 
+import static software.amazon.jdbc.hostlistprovider.monitoring.ClusterTopologyMonitorImpl.stuff;
 import static software.amazon.jdbc.plugin.failover.FailoverMode.STRICT_READER;
 
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -39,6 +42,7 @@ import software.amazon.jdbc.PluginManagerService;
 import software.amazon.jdbc.PluginService;
 import software.amazon.jdbc.PropertyDefinition;
 import software.amazon.jdbc.hostavailability.HostAvailability;
+import software.amazon.jdbc.hostlistprovider.monitoring.ClusterTopologyMonitorImpl.Info;
 import software.amazon.jdbc.plugin.AbstractConnectionPlugin;
 import software.amazon.jdbc.plugin.failover.FailoverFailedSQLException;
 import software.amazon.jdbc.plugin.failover.FailoverMode;
@@ -59,8 +63,7 @@ import software.amazon.jdbc.util.telemetry.TelemetryFactory;
 import software.amazon.jdbc.util.telemetry.TelemetryTraceLevel;
 
 /**
- * Failover Plugin v.2
- * This plugin provides cluster-aware failover features. The plugin switches connections upon
+ * Failover Plugin v.2 This plugin provides cluster-aware failover features. The plugin switches connections upon
  * detecting communication related exceptions and/or cluster topology changes.
  */
 public class FailoverConnectionPlugin extends AbstractConnectionPlugin {
@@ -292,7 +295,7 @@ public class FailoverConnectionPlugin extends AbstractConnectionPlugin {
 
     Throwable exceptionToThrow = wrapperException;
     if (originalException != null) {
-      LOGGER.finer(() -> Messages.get("Failover.detectedException", new Object[]{originalException.getMessage()}));
+      LOGGER.severe(() -> Messages.get("Failover.detectedException", new Object[] {originalException.getMessage()}));
       if (this.lastExceptionDealtWith != originalException
           && shouldExceptionTriggerConnectionSwitch(originalException)) {
         this.invalidateCurrentConnection();
@@ -326,8 +329,7 @@ public class FailoverConnectionPlugin extends AbstractConnectionPlugin {
   }
 
   /**
-   * Initiates the failover procedure. This process tries to establish a new connection to an
-   * instance in the topology.
+   * Initiates the failover procedure. This process tries to establish a new connection to an instance in the topology.
    *
    * @throws SQLException if an error occurs
    */
@@ -382,8 +384,8 @@ public class FailoverConnectionPlugin extends AbstractConnectionPlugin {
       throw ex;
     } finally {
       LOGGER.finest(() -> Messages.get(
-              "Failover.readerFailoverElapsed",
-              new Object[]{TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - failoverStartNano)}));
+          "Failover.readerFailoverElapsed",
+          new Object[] {TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - failoverStartNano)}));
       telemetryContext.closeContext();
       if (this.telemetryFailoverAdditionalTopTraceSetting) {
         telemetryFactory.postCopy(telemetryContext, TelemetryTraceLevel.FORCE_TOP_LEVEL);
@@ -419,7 +421,7 @@ public class FailoverConnectionPlugin extends AbstractConnectionPlugin {
           LOGGER.finest(
               Utils.logTopology(
                   new ArrayList<>(remainingReaders),
-                  Messages.get("Failover.errorSelectingReaderHost", new Object[]{ex.getMessage()})));
+                  Messages.get("Failover.errorSelectingReaderHost", new Object[] {ex.getMessage()})));
           break;
         }
 
@@ -448,7 +450,7 @@ public class FailoverConnectionPlugin extends AbstractConnectionPlugin {
             readerCandidates.remove(readerCandidate);
           } else {
             LOGGER.fine(
-                Messages.get("Failover.strictReaderUnknownHostRole", new Object[]{readerCandidate.getUrl()}));
+                Messages.get("Failover.strictReaderUnknownHostRole", new Object[] {readerCandidate.getUrl()}));
           }
         } catch (SQLException ex) {
           remainingReaders.remove(readerCandidate);
@@ -483,10 +485,10 @@ public class FailoverConnectionPlugin extends AbstractConnectionPlugin {
         if (role == HostRole.WRITER) {
           isOriginalWriterStillWriter = true;
         } else {
-          LOGGER.fine(Messages.get("Failover.strictReaderUnknownHostRole", new Object[]{originalWriter.getUrl()}));
+          LOGGER.fine(Messages.get("Failover.strictReaderUnknownHostRole", new Object[] {originalWriter.getUrl()}));
         }
       } catch (SQLException ex) {
-        LOGGER.fine(Messages.get("Failover.failedReaderConnection", new Object[]{originalWriter.getUrl()}));
+        LOGGER.fine(Messages.get("Failover.failedReaderConnection", new Object[] {originalWriter.getUrl()}));
       }
     } while (System.nanoTime() < failoverEndTimeNano); // All hosts failed. Keep trying until we hit the timeout.
 
@@ -494,6 +496,20 @@ public class FailoverConnectionPlugin extends AbstractConnectionPlugin {
   }
 
   protected void throwFailoverSuccessException() throws SQLException {
+    Map<String, Map<String, List<Info>>> v = stuff.stream()
+        .sorted(Comparator.comparing(x -> x.timestamp.toEpochMilli()))
+        .collect(Collectors.groupingBy(
+            x -> x.node,
+            Collectors.groupingBy(x -> x.writer)
+        ));
+
+    v.forEach((node, writerMap) -> {
+      writerMap.values().stream()
+          .map(list -> list.get(0))
+          .forEach(info -> LOGGER.severe("  " + info));
+      System.out.println();
+    });
+
     if (isInTransaction || this.pluginService.isInTransaction()) {
       if (this.pluginManagerService != null) {
         this.pluginManagerService.setInTransaction(false);
@@ -561,9 +577,9 @@ public class FailoverConnectionPlugin extends AbstractConnectionPlugin {
       } catch (SQLException ex) {
         this.failoverWriterFailedCounter.inc();
         LOGGER.severe(
-            Messages.get("Failover.exceptionConnectingToWriter", new Object[]{writerCandidate.getHost()}));
+            Messages.get("Failover.exceptionConnectingToWriter", new Object[] {writerCandidate.getHost()}));
         throw new FailoverFailedSQLException(
-            Messages.get("Failover.exceptionConnectingToWriter", new Object[]{writerCandidate.getHost()}), ex);
+            Messages.get("Failover.exceptionConnectingToWriter", new Object[] {writerCandidate.getHost()}), ex);
       }
 
       HostRole role = this.pluginService.getHostRole(writerCandidateConn);
@@ -575,9 +591,9 @@ public class FailoverConnectionPlugin extends AbstractConnectionPlugin {
         }
         this.failoverWriterFailedCounter.inc();
         LOGGER.severe(
-            Messages.get("Failover.unexpectedReaderRole", new Object[]{writerCandidate.getHost(), role}));
+            Messages.get("Failover.unexpectedReaderRole", new Object[] {writerCandidate.getHost(), role}));
         throw new FailoverFailedSQLException(
-            Messages.get("Failover.unexpectedReaderRole", new Object[]{writerCandidate.getHost(), role}));
+            Messages.get("Failover.unexpectedReaderRole", new Object[] {writerCandidate.getHost(), role}));
       }
 
       this.pluginService.setCurrentConnection(writerCandidateConn, writerCandidate);
@@ -585,7 +601,7 @@ public class FailoverConnectionPlugin extends AbstractConnectionPlugin {
       LOGGER.fine(
           () -> Messages.get(
               "Failover.establishedConnection",
-              new Object[]{this.pluginService.getCurrentHostSpec()}));
+              new Object[] {this.pluginService.getCurrentHostSpec()}));
       throwFailoverSuccessException();
     } catch (FailoverSuccessSQLException ex) {
       this.failoverWriterSuccessCounter.inc();
@@ -600,7 +616,7 @@ public class FailoverConnectionPlugin extends AbstractConnectionPlugin {
     } finally {
       LOGGER.finest(() -> Messages.get(
           "Failover.writerFailoverElapsed",
-          new Object[]{TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - failoverStartTimeNano)}));
+          new Object[] {TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - failoverStartTimeNano)}));
       telemetryContext.closeContext();
       if (this.telemetryFailoverAdditionalTopTraceSetting) {
         telemetryFactory.postCopy(telemetryContext, TelemetryTraceLevel.FORCE_TOP_LEVEL);
@@ -692,7 +708,7 @@ public class FailoverConnectionPlugin extends AbstractConnectionPlugin {
       LOGGER.finer(
           () -> Messages.get(
               "Failover.parameterValue",
-              new Object[]{"failoverMode", this.failoverMode}));
+              new Object[] {"failoverMode", this.failoverMode}));
     }
   }
 
@@ -711,7 +727,7 @@ public class FailoverConnectionPlugin extends AbstractConnectionPlugin {
 
     if (!ENABLE_CONNECT_FAILOVER.getBoolean(props)) {
       return this.staleDnsHelper.getVerifiedConnection(isInitialConnection, this.hostListProviderService,
-            driverProtocol, hostSpec, props, connectFunc);
+          driverProtocol, hostSpec, props, connectFunc);
     }
 
     final HostSpec hostSpecWithAvailability = this.pluginService.getHosts().stream()

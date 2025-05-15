@@ -27,8 +27,12 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -58,6 +62,32 @@ import software.amazon.jdbc.util.SynchronousExecutor;
 import software.amazon.jdbc.util.Utils;
 
 public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
+
+  public static class Info {
+
+    public Instant timestamp;
+    public String node;
+    public String writer = null;
+    public Timestamp lastUpdateTime;
+    public int durable_lsn;
+    public Integer highest_lsn_rcvd;
+    public Integer current_read_lsn;
+
+    public Info(Instant timestamp, String node, Timestamp lastUpdateTime, int durable_lsn,
+        Integer highest_lsn_rcvd, Integer current_read_lsn) {
+      this.timestamp = timestamp;
+      this.node = node;
+      this.lastUpdateTime = lastUpdateTime;
+      this.durable_lsn = durable_lsn;
+      this.highest_lsn_rcvd = highest_lsn_rcvd;
+      this.current_read_lsn = current_read_lsn;
+    }
+
+    public String toString() {
+      return String.format("t:%s, n:%s, w:%s, lut:%s, dlsn:%s, hlsn:%s, crlsn:%s", timestamp, node, writer,
+          lastUpdateTime, durable_lsn, highest_lsn_rcvd, current_read_lsn);
+    }
+  }
 
   private static final Logger LOGGER = Logger.getLogger(ClusterTopologyMonitorImpl.class.getName());
 
@@ -89,6 +119,7 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
   protected final String writerTopologyQuery;
   protected final HostListProviderService hostListProviderService;
   protected final HostSpec clusterInstanceTemplate;
+  public final static ConcurrentLinkedQueue<Info> stuff = new ConcurrentLinkedQueue<>();
 
   protected String clusterId;
   protected final AtomicReference<HostSpec> writerHostSpec = new AtomicReference<>(null);
@@ -107,7 +138,7 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
   protected final AtomicReference<HostSpec> nodeThreadsWriterHostSpec = new AtomicReference<>(null);
   protected final AtomicReference<Connection> nodeThreadsReaderConnection = new AtomicReference<>(null);
   protected final AtomicReference<List<HostSpec>> nodeThreadsLatestTopology = new AtomicReference<>(null);
-
+  protected final static ConcurrentHashMap<String, String> reportedWriterCandidates = new ConcurrentHashMap<>();
 
   protected final ExecutorService monitorExecutor = Executors.newSingleThreadExecutor(runnableTarget -> {
     final Thread monitoringThread = new Thread(runnableTarget);
@@ -259,7 +290,7 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
     if (System.nanoTime() >= end) {
       throw new TimeoutException(Messages.get(
           "ClusterTopologyMonitorImpl.topologyNotUpdated",
-          new Object[]{timeoutMs}));
+          new Object[] {timeoutMs}));
     }
 
     return latestHosts;
@@ -288,7 +319,7 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
     try {
       LOGGER.finest(() -> Messages.get(
           "ClusterTopologyMonitorImpl.startMonitoringThread",
-          new Object[]{this.initialHostSpec.getHost()}));
+          new Object[] {this.initialHostSpec.getHost()}));
 
       while (!this.stop.get()) {
 
@@ -296,6 +327,7 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
 
           if (this.submittedNodes.isEmpty()) {
             LOGGER.finest(Messages.get("ClusterTopologyMonitorImpl.startingNodeMonitoringThreads"));
+            reportedWriterCandidates.clear();
 
             // start node threads
             this.nodeThreadsStop.set(false);
@@ -335,27 +367,33 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
               LOGGER.finest(
                   Messages.get(
                       "ClusterTopologyMonitorImpl.writerPickedUpFromNodeMonitors",
-                      new Object[]{writerConnectionHostSpec}));
+                      new Object[] {writerConnectionHostSpec}));
 
               this.closeConnection(this.monitoringConnection.get());
-              this.monitoringConnection.set(writerConnection);
-              this.writerHostSpec.set(writerConnectionHostSpec);
-              this.isVerifiedWriterConnection = true;
-              this.highRefreshRateEndTimeNano = System.nanoTime() + highRefreshPeriodAfterPanicNano;
 
-              // We verify the writer on initial connection and on failover, but we only want to ignore new topology
-              // requests after failover. To accomplish this, the first time we verify the writer we set the ignore end
-              // time to 0. Any future writer verifications will set it to a positive value.
-              if (!this.ignoreNewTopologyRequestsEndTimeNano.compareAndSet(-1, 0)) {
-                this.ignoreNewTopologyRequestsEndTimeNano.set(System.nanoTime() + ignoreTopologyRequestNano);
+              final String writerId = this.verifyWriterFromThreads();
+              if (writerId != null) {
+                this.monitoringConnection.set(writerConnection);
+                this.writerHostSpec.set(writerConnectionHostSpec);
+                LOGGER.finest("Returning verified writer: " + writerConnectionHostSpec.getHost());
+                this.isVerifiedWriterConnection = true;
+                this.highRefreshRateEndTimeNano = System.nanoTime() + highRefreshPeriodAfterPanicNano;
+
+                this.updateTopologyCache(this.nodeThreadsLatestTopology.get());
+
+                // We verify the writer on initial connection and on failover, but we only want to ignore new topology
+                // requests after failover. To accomplish this, the first time we verify the writer we set the ignored end
+                // time to 0. Any future writer verifications will set it to a positive value.
+                if (!this.ignoreNewTopologyRequestsEndTimeNano.compareAndSet(-1, 0)) {
+                  this.ignoreNewTopologyRequestsEndTimeNano.set(System.nanoTime() + ignoreTopologyRequestNano);
+                }
+
+                this.nodeThreadsStop.set(true);
+                this.shutdownNodeExecutorService();
+                this.submittedNodes.clear();
+
+                continue;
               }
-
-              this.nodeThreadsStop.set(true);
-              this.shutdownNodeExecutorService();
-              this.submittedNodes.clear();
-
-              continue;
-
             } else {
               // update node threads with new nodes in the topology
               List<HostSpec> hosts = this.nodeThreadsLatestTopology.get();
@@ -377,7 +415,6 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
 
         } else {
           // regular mode (not panic mode)
-
           if (!this.submittedNodes.isEmpty()) {
             this.shutdownNodeExecutorService();
             this.submittedNodes.clear();
@@ -423,7 +460,7 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
             Level.FINEST,
             Messages.get(
                 "ClusterTopologyMonitorImpl.exceptionDuringMonitoringStop",
-                new Object[]{this.initialHostSpec.getHost()}),
+                new Object[] {this.initialHostSpec.getHost()}),
             ex);
       }
 
@@ -437,8 +474,26 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
 
       LOGGER.finest(() -> Messages.get(
           "ClusterTopologyMonitorImpl.stopMonitoringThread",
-          new Object[]{this.initialHostSpec.getHost()}));
+          new Object[] {this.initialHostSpec.getHost()}));
     }
+  }
+
+  private String verifyWriterFromThreads() {
+    final Map<String, Integer> writerCount = new HashMap<>();
+    for (Entry<String, String> candidate : reportedWriterCandidates.entrySet()) {
+      writerCount.putIfAbsent(candidate.getValue(), 0);
+      final int count = writerCount.computeIfPresent(candidate.getValue(), (k, v) -> v + 1);
+      if (count >= (submittedNodes.size())) {
+        LOGGER.info("verified writer::: " + candidate.getValue());
+
+        return candidate.getValue();
+      }
+    }
+    return null;
+  }
+
+  private void stopThreads() {
+    this.nodeThreadsStop.set(true);
   }
 
   protected void shutdownNodeExecutorService() {
@@ -512,10 +567,11 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
       if (this.monitoringConnection.compareAndSet(null, conn)) {
         LOGGER.finest(() -> Messages.get(
             "ClusterTopologyMonitorImpl.openedMonitoringConnection",
-            new Object[]{this.initialHostSpec.getHost()}));
+            new Object[] {this.initialHostSpec.getHost()}));
 
         try {
-          if (!StringUtils.isNullOrEmpty(this.getWriterNodeId(this.monitoringConnection.get()))) {
+          final String writerNodeId = this.getWriterNodeId(this.monitoringConnection.get());
+          if (!StringUtils.isNullOrEmpty(writerNodeId) && writerNodeId.equals(this.initialHostSpec.getHostId())) {
             this.isVerifiedWriterConnection = true;
             writerVerifiedByThisThread = true;
 
@@ -524,7 +580,7 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
               LOGGER.finest(
                   Messages.get(
                       "ClusterTopologyMonitorImpl.writerMonitoringConnection",
-                      new Object[]{this.writerHostSpec.get().getHost()}));
+                      new Object[] {this.writerHostSpec.get().getHost()}));
             } else {
               final String nodeId = this.getNodeId(this.monitoringConnection.get());
               if (!StringUtils.isNullOrEmpty(nodeId)) {
@@ -532,7 +588,7 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
                 LOGGER.finest(
                     Messages.get(
                         "ClusterTopologyMonitorImpl.writerMonitoringConnection",
-                        new Object[]{this.writerHostSpec.get().getHost()}));
+                        new Object[] {this.writerHostSpec.get().getHost()}));
               }
             }
           }
@@ -629,13 +685,11 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
     }
     try {
       final List<HostSpec> hosts = this.queryForTopology(connection);
-      if (!Utils.isNullOrEmpty(hosts)) {
-        this.updateTopologyCache(hosts);
-      }
+      this.nodeThreadsLatestTopology.set(hosts);
       return hosts;
     } catch (SQLException ex) {
       // do nothing
-      LOGGER.finest(Messages.get("ClusterTopologyMonitorImpl.errorFetchingTopology", new Object[]{ex}));
+      LOGGER.finest(Messages.get("ClusterTopologyMonitorImpl.errorFetchingTopology", new Object[] {ex}));
     }
     return null;
   }
@@ -662,6 +716,43 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
       }
     }
     return null;
+  }
+
+  protected String getWriterInfo(final HostSpec host, final Connection connection) throws SQLException {
+    final String q =
+        "SELECT server_id, session_id, durable_lsn, highest_lsn_rcvd, current_read_lsn, last_update_timestamp "
+            + "FROM aurora_replica_status() "
+            + "WHERE SERVER_ID = aurora_db_instance_identifier() "
+            + "   OR SESSION_ID = 'MASTER_SESSION_ID'";
+    String writer = null;
+    Info info = null;
+    try (final Statement stmt = connection.createStatement()) {
+      try (final ResultSet resultSet = stmt.executeQuery(q)) {
+        while (resultSet.next()) {
+          if (resultSet.getString("session_id").equals("MASTER_SESSION_ID")) {
+            writer = resultSet.getString(1);
+          } else {
+            Timestamp lastUpdateTime;
+            String serverId = resultSet.getString("server_id");
+            Integer durableLsn = resultSet.getInt("durable_lsn");
+            int highestLsn = resultSet.getInt("highest_lsn_rcvd");
+            Integer currentReadLsn = resultSet.getInt("current_read_lsn");
+            try {
+              lastUpdateTime = resultSet.getTimestamp(5);
+            } catch (Exception e) {
+              lastUpdateTime = Timestamp.from(Instant.now());
+            }
+
+            info = new Info(Instant.now(), host.getHost(), lastUpdateTime, durableLsn, highestLsn, currentReadLsn);
+          }
+        }
+        if (writer != null && info.writer == null) {
+          info.writer = writer;
+        }
+        stuff.add(info);
+      }
+    }
+    return writer;
   }
 
   protected @Nullable List<HostSpec> queryForTopology(final Connection conn) throws SQLException {
@@ -715,7 +806,7 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
         hostMap.put(host.getHost(), host);
       } catch (Exception e) {
         LOGGER.finest(
-            Messages.get("ClusterTopologyMonitorImpl.errorProcessingQueryResults", new Object[]{e.getMessage()}));
+            Messages.get("ClusterTopologyMonitorImpl.errorProcessingQueryResults", new Object[] {e.getMessage()}));
         return null;
       }
     }
@@ -847,7 +938,6 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
           }
 
           if (connection != null) {
-
             String writerId = null;
             try {
               writerId = this.monitor.getWriterNodeId(connection);
@@ -863,28 +953,36 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
             }
 
             if (!StringUtils.isNullOrEmpty(writerId)) {
-              // this prevents closing connection in finally block
-              if (!this.monitor.nodeThreadsWriterConnection.compareAndSet(null, connection)) {
-                // writer connection is already setup
-                this.monitor.closeConnection(connection);
+              // LOGGER.info("REPORTING WRITER:: " + writerId + " from thread: " + hostSpec.getHost());
+              this.reportWriterCandidate(hostSpec.getHost(), writerId);
+            }
 
-              } else {
-                // writer connection is successfully set to writerConnection
-                LOGGER.fine(Messages.get("NodeMonitoringThread.detectedWriter", new Object[]{writerId}));
-                // When nodeThreadsWriterConnection and nodeThreadsWriterHostSpec are both set, the topology monitor may
-                // set ignoreNewTopologyRequestsEndTimeNano, in which case other threads will use the cached topology
-                // for the ignore duration, so we need to update the topology before setting nodeThreadsWriterHostSpec.
-                this.monitor.fetchTopologyAndUpdateCache(connection);
-                this.monitor.nodeThreadsWriterHostSpec.set(hostSpec);
-                this.monitor.nodeThreadsStop.set(true);
-                LOGGER.fine(Utils.logTopology(
-                    this.monitor.topologyMap.get(this.monitor.clusterId)));
+            if (Objects.equals(writerId, hostSpec.getHostId())) {
+              // this prevents closing connection in finally block
+              final Connection conn = this.monitor.nodeThreadsWriterConnection.get();
+              if (conn != connection) {
+                this.monitor.nodeThreadsWriterConnection.set(connection);
+                this.monitor.closeConnection(conn);
               }
+              // writer connection is successfully set to writerConnection
+              LOGGER.fine(Messages.get("NodeMonitoringThread.detectedWriter", new Object[] {writerId}));
+              // When nodeThreadsWriterConnection and nodeThreadsWriterHostSpec are both set, the topology monitor may
+              // set ignoreNewTopologyRequestsEndTimeNano, in which case other threads will use the cached topology
+              // for the ignored duration, so we need to update the topology before setting nodeThreadsWriterHostSpec.
+              this.monitor.fetchTopologyAndUpdateCache(connection);
+              final HostSpec host = this.monitor.topologyMap.get(this.monitor.clusterId).stream()
+                  .filter(x -> x.getHost().equals(hostSpec.getHost())).findFirst().orElse(null);
+              stuff.add(new Info(Instant.now(), hostSpec.getHost(), writerId, host.getLastUpdateTime()));
+              // this.readerThreadFetchTopology(connection, writerHostSpec);
+              this.monitor.nodeThreadsWriterHostSpec.set(hostSpec);
+              // this.monitor.nodeThreadsStop.set(true);
+              LOGGER.fine(Utils.logTopology(
+                  this.monitor.topologyMap.get(this.monitor.clusterId)));
 
               // Setting the connection to null here prevents the final block
               // from closing nodeThreadsWriterConnection.
               connection = null;
-              return;
+              // return;
 
             } else if (connection != null) {
               // this connection is a reader connection
@@ -912,6 +1010,10 @@ public class ClusterTopologyMonitorImpl implements ClusterTopologyMonitor {
         LOGGER.finest(() -> Messages.get("NodeMonitoringThread.threadCompleted",
             new Object[] {TimeUnit.NANOSECONDS.toMillis(end - start)}));
       }
+    }
+
+    private void reportWriterCandidate(final String threadId, final String writerId) {
+      reportedWriterCandidates.put(threadId, writerId);
     }
 
     private void readerThreadFetchTopology(final Connection connection, final @Nullable HostSpec writerHostSpec) {
