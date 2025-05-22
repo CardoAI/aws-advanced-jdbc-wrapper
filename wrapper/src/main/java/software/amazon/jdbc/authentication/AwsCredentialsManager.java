@@ -16,14 +16,18 @@
 
 package software.amazon.jdbc.authentication;
 
+import java.nio.file.Paths;
 import java.util.Properties;
 import java.util.concurrent.locks.ReentrantLock;
 import org.checkerframework.checker.nullness.qual.Nullable;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.DefaultCredentialsProvider;
+import software.amazon.awssdk.auth.credentials.ProfileProviderCredentialsContext;
+import software.amazon.awssdk.profiles.Profile;
+import software.amazon.awssdk.profiles.ProfileFile;
+import software.amazon.awssdk.services.sso.auth.SsoProfileCredentialsProviderFactory;
 import software.amazon.jdbc.HostSpec;
 import software.amazon.jdbc.PropertyDefinition;
-import software.amazon.jdbc.util.Messages;
 import software.amazon.jdbc.util.StringUtils;
 
 public class AwsCredentialsManager {
@@ -57,7 +61,11 @@ public class AwsCredentialsManager {
           : handler.getAwsCredentialsProvider(hostSpec, props);
 
       if (provider == null) {
-        provider = getDefaultProvider(PropertyDefinition.AWS_PROFILE.getString(props));
+        provider =
+            getDefaultProvider(
+                PropertyDefinition.AWS_PROFILE.getString(props),
+                PropertyDefinition.AWS_SSO.getBoolean(props)
+            );
       }
 
       return provider;
@@ -66,11 +74,26 @@ public class AwsCredentialsManager {
     }
   }
 
-  private static AwsCredentialsProvider getDefaultProvider(final @Nullable String awsProfileName) {
-    DefaultCredentialsProvider.Builder builder = DefaultCredentialsProvider.builder();
-    if (!StringUtils.isNullOrEmpty(awsProfileName)) {
-      builder.profileName(awsProfileName);
+  private static AwsCredentialsProvider getDefaultProvider(
+      final @Nullable String awsProfileName, final boolean useSso) {
+    if (useSso) {
+      // Load shared AWS config (~/.aws/config)
+      ProfileFile profileFile = ProfileFile.defaultProfileFile();
+      Profile profile = profileFile.profile(awsProfileName)
+          .orElseThrow(() -> new IllegalArgumentException("Profile not found: " + awsProfileName));
+      ProfileProviderCredentialsContext profileProvider =
+          ProfileProviderCredentialsContext.builder()
+              .profile(profile)
+              .profileFile(profileFile)
+              .build();
+      SsoProfileCredentialsProviderFactory factory = new SsoProfileCredentialsProviderFactory();
+      return factory.create(profileProvider);
+    } else {
+      DefaultCredentialsProvider.Builder builder = DefaultCredentialsProvider.builder();
+      if (!StringUtils.isNullOrEmpty(awsProfileName)) {
+        builder.profileName(awsProfileName);
+      }
+      return builder.build();
     }
-    return builder.build();
   }
 }

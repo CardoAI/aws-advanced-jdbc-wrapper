@@ -110,6 +110,16 @@ public class PropertyDefinition {
       new AwsWrapperProperty(
           "awsProfile", null, "Name of the AWS Profile to use for IAM/SecretsManager auth.");
 
+  public static final AwsWrapperProperty AWS_SSO =
+      new AwsWrapperProperty(
+          "awsSso",
+          "false",
+          "Enable AWS SSO support.",
+          false,
+          new String[] {
+              "true", "false"
+          });
+
   public static final AwsWrapperProperty LOGIN_TIMEOUT =
       new AwsWrapperProperty(
           "loginTimeout", null, "Login timeout in msec.");
